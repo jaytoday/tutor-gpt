@@ -1,53 +1,90 @@
 # core functionality
 
 import discord
-import time
-import globals
+from __main__ import THOUGHT_CHANNEL, honcho, app
 from discord.ext import commands
 from typing import Optional
-from chain import chat, ConversationCache
+
+from agent.chain import ThinkCall, RespondCall
+from honcho.types.apps import User
+from honcho.types.apps.users import Session
+
+import sentry_sdk
+
+
+def chat(message: str, user: User, session: Session):
+    thought: str = (
+        ThinkCall(
+            user_input=message,
+            app_id=app.id,
+            user_id=user.id,
+            session_id=session.id,
+            honcho=honcho,
+        )
+        .call()
+        .content
+    )
+    yield thought
+    response = (
+        RespondCall(
+            user_input=message,
+            thought=thought,
+            app_id=app.id,
+            user_id=user.id,
+            session_id=session.id,
+            honcho=honcho,
+        )
+        .call()
+        .content
+    )
+    yield response
+    new_message = honcho.apps.users.sessions.messages.create(
+        is_user=True,
+        session_id=session.id,
+        app_id=app.id,
+        user_id=user.id,
+        content=message,
+    )
+    honcho.apps.users.sessions.metamessages.create(
+        app_id=app.id,
+        session_id=session.id,
+        user_id=user.id,
+        message_id=new_message.id,
+        metamessage_type="thought",
+        content=thought,
+    )
+    honcho.apps.users.sessions.messages.create(
+        is_user=False,
+        session_id=session.id,
+        app_id=app.id,
+        user_id=user.id,
+        content=response,
+    )
 
 
 class Core(commands.Cog):
     def __init__(self, bot) -> None:
         self.bot = bot
 
-    async def chat_and_save(self, local_chain: ConversationCache, input: str) -> tuple[str, str]:
-        thought_chain =  globals.OBJECTIVE_THOUGHT_CHAIN 
-        response_chain = globals.OBJECTIVE_RESPONSE_CHAIN # if local_chain.conversation_type == "discuss" else globals.WORKSHOP_RESPONSE_CHAIN
-        # response_chain = local_chain.conversation_type == "discuss" ? globals.DISCUSS_RESPONSE_CHAIN : globals.WORKSHOP_RESPONSE_CHAIN
-        
-        thought = await chat(
-            inp=input,
-            thought_chain=thought_chain,
-            thought_memory=local_chain.thought_memory
-        )
-        response = await chat(
-            inp=input,
-            thought=thought,
-            response_chain=response_chain,
-            response_memory=local_chain.response_memory
-        )
-        local_chain.thought_memory.save_context({"input":input}, {"output": thought})
-        local_chain.response_memory.save_context({"input":input}, {"output": response})
-        return thought, response
-    
     @commands.Cog.listener()
     async def on_member_join(self, member):
-        welcome_message = """
-Hello! Thanks for joining the Bloom server. 
+        with sentry_sdk.start_transaction(
+            op="on_member_join", name="discord.on_member_join"
+        ):
+            welcome_message = """
+    Hello! Thanks for joining the Bloom server. 
 
-I’m your Aristotelian learning companion — here to help you follow your curiosity in whatever direction you like. My engineering makes me extremely receptive to your needs and interests. You can reply normally, and I’ll always respond!
+    I’m your Aristotelian learning companion — here to help you follow your curiosity in whatever direction you like. My engineering makes me extremely receptive to your needs and interests. You can reply normally, and I’ll always respond!
 
-If I'm off track, just say so! If you'd like to reset our dialogue, use the /restart  command.
+    If I'm off track, just say so! If you'd like to reset our dialogue, use the /restart  command.
 
-Need to leave or just done chatting? Let me know! I’m conversational by design so I’ll say goodbye 😊.
+    Need to leave or just done chatting? Let me know! I’m conversational by design so I’ll say goodbye 😊.
 
-If you have any further questions, use the /help command or feel free to post them in https://discord.com/channels/1076192451997474938/1092832830159065128 and someone from the Plastic Labs team will get back to you ASAP!
+    If you have any further questions, use the /help command or feel free to post them in https://discord.com/channels/1076192451997474938/1092832830159065128 and someone from the Plastic Labs team will get back to you ASAP!
 
-Enjoy!
-        """
-        await member.send(welcome_message)
+    Enjoy!
+            """
+            await member.send(welcome_message)
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -56,130 +93,124 @@ Enjoy!
 
     @commands.Cog.listener()
     async def on_message(self, message):
-        if message.author == self.bot.user:
-            return
+        with sentry_sdk.start_transaction(op="on_message", name="discord.on_message"):
+            # Don't let the bot reply too itself
+            if message.author == self.bot.user:
+                return
 
-        # if the message came from a DM channel...
-        if isinstance(message.channel, discord.channel.DMChannel):
-            LOCAL_CHAIN = globals.CACHE.get(message.channel.id)
-            if LOCAL_CHAIN is None:
-                LOCAL_CHAIN = ConversationCache()
-                globals.CACHE.put(message.channel.id, LOCAL_CHAIN)
+            user_id = f"discord_{str(message.author.id)}"
+            user = honcho.apps.users.get_or_create(name=user_id, app_id=app.id)
+            # Get cache for conversation
+            # async with LOCK:
+            #     CONVERSATION = CACHE.get_or_create(
+            #         location_id=str(message.channel.id), user_id=user_id
+            #     )
 
-            i = message.content.replace(str('<@' + str(self.bot.user.id) + '>'), '')
-            
-            start = time.time()
-            async with message.channel.typing():
-                thought, response = await self.chat_and_save(LOCAL_CHAIN, i)
+            # Use the channel ID as the location_id (for DMs, this will be unique to the user)
+            location_id = str(message.channel.id)
 
-            thought_channel = self.bot.get_channel(int(globals.THOUGHT_CHANNEL))
-            link = f"DM: {message.author.mention}"
+            sessions_iter = honcho.apps.users.sessions.list(
+                app_id=app.id, user_id=user.id, reverse=True
+            )
+            sessions = list(sessions_iter)
+            session = None
+            if sessions:
+                # find the right session
+                for s in sessions:
+                    if s.metadata.get("location_id") == location_id:
+                        session = s
+                        print(session.id)
+                        break
+                # if no session is found after the for loop, create a new one
+                if not session:
+                    print("No session found amongst existing ones, creating new one")
+                    session = honcho.apps.users.sessions.create(
+                        user_id=user.id,
+                        app_id=app.id,
+                        metadata={"location_id": location_id},
+                    )
+                    print(session.id)
+            else:
+                print("No active session found")
+                session = honcho.apps.users.sessions.create(
+                    user_id=user.id,
+                    app_id=app.id,
+                    metadata={"location_id": location_id},
+                )
+                print(session.id)
+
+            # Get the message content but remove any mentions
+            inp = message.content.replace(str("<@" + str(self.bot.user.id) + ">"), "")
             n = 1800
-            if len(thought) > n:
-                chunks = [thought[i:i+n] for i in range(0, len(thought), n)]
-                for i in range(chunks):
-                    await thought_channel.send(f"{link}\n```\nThought #{i}: {chunks[i]}\n```")
-            else:
-                await thought_channel.send(f"{link}\n```\nThought: {thought}\n```")
-            if len(response) > n:
-                chunks = [response[i:i+n] for i in range(0, len(response), n)]
-                for chunk in chunks:
-                    await message.channel.send(chunk)
-            else:
-                await message.channel.send(response)
 
-            end = time.time()
-            print(f"DM: {message.author.mention}")
-            print(f"Input: {i}")
-            print(f"Thought: {thought}")
-            print(f"Response: {response}")
-            print(f"Elapsed: {end - start}")
-            print("=========================================")
-
-
-        # if the user mentioned the bot outside of DMs...
-        if not isinstance(message.channel, discord.channel.DMChannel):
-            if str(self.bot.user.id) in message.content:
-                LOCAL_CHAIN = globals.CACHE.get(message.channel.id)
-                if LOCAL_CHAIN is None:
-                    LOCAL_CHAIN = ConversationCache()
-                    globals.CACHE.put(message.channel.id, LOCAL_CHAIN)
-
-                i = message.content.replace(str('<@' + str(self.bot.user.id) + '>'), '')
-
-                start = time.time()
+            async def respond(reply=True, forward_thought=True):
+                "Generate response too user"
                 async with message.channel.typing():
-                    thought, response = await self.chat_and_save(LOCAL_CHAIN, i)
+                    turn = chat(inp, user, session)
 
-                thought_channel = self.bot.get_channel(int(globals.THOUGHT_CHANNEL))
-                link = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{message.id}"
-                n = 1800
-                if len(thought) > n:
-                    chunks = [thought[i:i+n] for i in range(0, len(thought), n)]
-                    for i in range(chunks):
-                        await thought_channel.send(f"{link}\n```\nThought #{i}: {chunks[i]}\n```")
-                else:
-                    await thought_channel.send(f"{link}\n```\nThought: {thought}\n```")
+                    thought = next(turn)
+                    # sanitize thought by adding zero width spaces to triple backticks
+                    thought = thought.replace("```", "`\u200b`\u200b`")
 
-                if len(response) > n:
-                    chunks = [response[i:i+n] for i in range(0, len(response), n)]
-                    for chunk in chunks:
-                        await message.reply(chunk)
-                else:
-                    await message.reply(response)
+                    thought_channel = self.bot.get_channel(int(THOUGHT_CHANNEL))
 
-                end = time.time()
-                print(f"Link: {link}")
-                print(f"Input: {i}")
-                print(f"Thought: {thought}")
-                print(f"Response: {response}")
-                print(f"Elapsed: {end - start}")
-                print("=========================================")
+                    # Thought Forwarding
+                    if forward_thought:
+                        link = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{message.id}"
+                        if len(thought) > n:
+                            chunks = [
+                                thought[i : i + n] for i in range(0, len(thought), n)
+                            ]
+                            for i in range(len(chunks)):
+                                await thought_channel.send(
+                                    f"{link}\n```\nThought #{i}: {chunks[i]}\n```"
+                                )
+                        else:
+                            await thought_channel.send(
+                                f"{link}\n```\nThought: {thought}\n```"
+                            )
 
-        # if the user replied to the bot outside of DMs...
-        if not isinstance(message.channel, discord.channel.DMChannel):
-            if message.reference is not None:
-                LOCAL_CHAIN = globals.CACHE.get(message.channel.id)
-                if LOCAL_CHAIN is None:
-                    LOCAL_CHAIN = ConversationCache()
-                    globals.CACHE.put(message.channel.id, LOCAL_CHAIN)
-                # and if the referenced message is from the bot...
-                reply_msg = await self.bot.get_channel(message.channel.id).fetch_message(message.reference.message_id)
-                if reply_msg.author == self.bot.user:
-                    i = message.content.replace(str('<@' + str(self.bot.user.id) + '>'), '')
-                    # check that the reply isn't to one of the bot's thought messages
-                    if reply_msg.content.startswith("https://discord.com"):
-                        return
-                    if message.content.startswith("!no") or message.content.startswith("!No"):
-                        return
-                    start = time.time()
-                    async with message.channel.typing():
-                        thought, response = await self.chat_and_save(LOCAL_CHAIN, i)
+                    response = next(turn)
 
-                    thought_channel = self.bot.get_channel(int(globals.THOUGHT_CHANNEL))
-                    link = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{message.id}"
-                    n = 1800
-                    if len(thought) > n:
-                        chunks = [thought[i:i+n] for i in range(0, len(thought), n)]
-                        for i in range(chunks):
-                            await thought_channel.send(f"{link}\n```\nThought #{i}: {chunks[i]}\n```")
-                    else:
-                        await thought_channel.send(f"{link}\n```\nThought: {thought}\n```")
-
+                    # Response Forwarding
                     if len(response) > n:
-                        chunks = [response[i:i+n] for i in range(0, len(response), n)]
+                        chunks = [
+                            response[i : i + n] for i in range(0, len(response), n)
+                        ]
                         for chunk in chunks:
-                            await message.reply(chunk)
+                            if reply:
+                                await message.reply(chunk)
+                            else:
+                                await message.channel.send(chunk)
                     else:
-                        await message.reply(response)
+                        if reply:
+                            await message.reply(response)
+                        else:
+                            await message.channel.send(response)
 
-                    end = time.time()
-                    print(f"Link: {link}")
-                    print(f"Input: {i}")
-                    print(f"Thought: {thought}")
-                    print(f"Response: {response}")
-                    print(f"Elapsed: {end - start}")
-                    print("=========================================")
+            # if the message came from a DM channel...
+            if isinstance(message.channel, discord.DMChannel):
+                await respond(reply=False, forward_thought=False)
+
+            # If the bot was mentioned in the message
+            if not isinstance(message.channel, discord.DMChannel):
+                if str(self.bot.user.id) in message.content:
+                    await respond(forward_thought=True)
+
+            # If the bot was replied to in the message
+            if not isinstance(message.channel, discord.DMChannel):
+                if message.reference is not None:
+                    reply_msg = await self.bot.get_channel(
+                        message.channel.id
+                    ).fetch_message(message.reference.message_id)
+                    if reply_msg.author == self.bot.user:
+                        if reply_msg.content.startswith("https://discord.com"):
+                            return
+                        if message.content.startswith(
+                            "!no"
+                        ) or message.content.startswith("!No"):
+                            return
+                        await respond(forward_thought=True)
 
     @commands.slash_command(description="Help using the bot")
     async def help(self, ctx: discord.ApplicationContext):
@@ -213,45 +244,38 @@ If you're still having trouble, drop a message in https://discord.com/channels/1
         await ctx.respond(help_message)
 
     @commands.slash_command(description="Restart the conversation with the tutor")
-    async def restart(self, ctx: discord.ApplicationContext, respond: Optional[bool] = True):
-        """
-        Clears the conversation history and reloads the chains
+    async def restart(
+        self, ctx: discord.ApplicationContext, respond: Optional[bool] = True
+    ):
+        with sentry_sdk.start_transaction(op="restart", name="discord.restart"):
+            """
+            Clears the conversation history and reloads the chains
 
-        Args:
-            ctx: context, necessary for bot commands
-        """
-        LOCAL_CHAIN = globals.CACHE.get(ctx.channel_id)
-        if LOCAL_CHAIN:
-            LOCAL_CHAIN.restart()
-        else:
-            LOCAL_CHAIN = ConversationCache()
-            globals.CACHE.put(ctx.channel_id, LOCAL_CHAIN )
-        # globals.restart()
+            Args:
+                ctx: context, necessary for bot commands
+            """
+            user_id = f"discord_{str(ctx.author.id)}"
+            user = honcho.apps.users.get_or_create(name=user_id, app_id=app.id)
+            location_id = str(ctx.channel_id)
 
-        if respond:
-            msg = "Great! The conversation has been restarted. What would you like to talk about?"
-            LOCAL_CHAIN.response_memory.chat_memory.add_ai_message(msg)
+            sessions = honcho.apps.users.sessions.list(
+                app_id=app.id, user_id=user.id, reverse=True
+            )
+
+            sessions_list = list(sessions)
+            if sessions_list:
+                # find the right session to delete
+                for session in sessions_list:
+                    if session.metadata.get("location_id") == location_id:
+                        honcho.apps.users.sessions.delete(
+                            app_id=app.id, user_id=user.id, session_id=session.id
+                        )
+                        break
+                msg = "The conversation has been restarted."
+            else:
+                msg = "No active conversation found to restart."
+
             await ctx.respond(msg)
-        else:
-            return
-        
-    @commands.slash_command(description="Help using the bot")
-    async def help(self, ctx: discord.ApplicationContext):
-        """
-        Displays help message
-        """
-        help_message = """
-Bloom is your reading and writing tutor. It needs context to start the conversation. That can be either
-            
-            1. a passage of reading you're struggling to understand
-            2. a snippet of writing you're working on
-        
-Paste either after the `/context` command and select what you'd like to do. Then just chat!
-If you'd like to restart the conversation, use the `/restart` command. Then you can use `/context` again with new context!
-If you're still having trouble, drop a message in https://discord.com/channels/1076192451997474938/1092832830159065128 and Bloom's builders will help you out!
-        """
-        await ctx.respond(help_message)
-
 
 
 def setup(bot):
